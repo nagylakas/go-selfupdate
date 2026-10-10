@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
-	"encoding/json"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -21,12 +23,17 @@ type Manifest struct {
 	SourceCommit string     `json:"source_commit"`
 	BuildTimeUTC string     `json:"build_time_utc"`
 	Artifacts    []Artifact `json:"artifacts"`
+	// Signature is the base64 ed25519 signature written by SignManifest.
+	Signature string `json:"signature,omitempty"`
 }
 
 // Artifact identifies a downloadable update package.
 type Artifact struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
+	// SHA256 is the lowercase hex SHA-256 digest of the package. When set,
+	// Apply verifies the download against it before extraction.
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // ProgressStep identifies a coarse-grained step in the update process.
@@ -62,6 +69,29 @@ type ApplyOptions struct {
 	ArtifactName string
 	Entries      []InstallEntry
 	OnProgress   func(step ProgressStep)
+
+	// PublicKeys, when set, makes Apply re-verify the manifest signature
+	// (see VerifyManifest) and implies RequireChecksum.
+	PublicKeys []ed25519.PublicKey
+	// RequireChecksum rejects an artifact without a SHA-256 checksum. A
+	// checksum present in the manifest is always verified.
+	RequireChecksum bool
+	// MaxDownloadBytes caps the artifact download; 0 means DefaultMaxDownloadBytes.
+	MaxDownloadBytes int64
+	// HTTPClient is used for the download; nil means http.DefaultClient.
+	HTTPClient *http.Client
+}
+
+// FetchOptions configures FetchManifestWithOptions.
+type FetchOptions struct {
+	BaseURL string
+	// PublicKeys, when set, requires a manifest signed by one of these keys
+	// with a SHA-256 checksum on every artifact (see VerifyManifest).
+	PublicKeys []ed25519.PublicKey
+	// MaxBytes caps the manifest size; 0 means DefaultMaxManifestBytes.
+	MaxBytes int64
+	// HTTPClient is used for the request; nil means http.DefaultClient.
+	HTTPClient *http.Client
 }
 
 // manifestPayload is the raw JSON structure of the update manifest as served by the remote endpoint.
@@ -72,20 +102,34 @@ type manifestPayload struct {
 	BuildTimeUTC    string     `json:"build_time_utc"`
 	Artifacts       []Artifact `json:"artifacts"`
 	LegacyLinuxFile string     `json:"linux_archive"`
+	Signature       string     `json:"signature"`
 }
 
-// FetchManifest downloads and validates the update manifest from the given base URL.
+// FetchManifest downloads and validates the update manifest from the given
+// base URL without requiring a signature. Prefer FetchManifestWithOptions
+// with PublicKeys.
 func FetchManifest(ctx context.Context, baseURL string) (*Manifest, error) {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	return FetchManifestWithOptions(ctx, FetchOptions{BaseURL: baseURL})
+}
+
+// FetchManifestWithOptions downloads latest.json from opts.BaseURL (size
+// capped) and validates it; with opts.PublicKeys it also verifies the
+// signature and requires artifact checksums.
+func FetchManifestWithOptions(ctx context.Context, opts FetchOptions) (*Manifest, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")
 	if baseURL == "" {
 		return nil, errors.New("update base URL is not configured")
+	}
+	maxBytes := opts.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxManifestBytes
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/latest.json", nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient(opts.HTTPClient).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -94,34 +138,21 @@ func FetchManifest(ctx context.Context, baseURL string) (*Manifest, error) {
 		return nil, errors.New("failed to fetch update manifest")
 	}
 
-	var payload manifestPayload
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
 		return nil, err
 	}
-	if payload.Version == "" {
-		return nil, errors.New("update manifest is missing a version")
+	if int64(len(data)) > maxBytes {
+		return nil, ErrTooLarge
 	}
+	return ParseManifest(data, opts.PublicKeys)
+}
 
-	artifacts := payload.Artifacts
-	if len(artifacts) == 0 && strings.TrimSpace(payload.LegacyLinuxFile) != "" {
-		artifacts = []Artifact{{
-			Name: "linux",
-			URL:  payload.LegacyLinuxFile,
-		}}
+func httpClient(c *http.Client) *http.Client {
+	if c != nil {
+		return c
 	}
-	if len(artifacts) == 0 {
-		return nil, errors.New("update manifest is missing artifacts")
-	}
-	if err := validateArtifacts(artifacts); err != nil {
-		return nil, err
-	}
-
-	return &Manifest{
-		Version:      payload.Version,
-		SourceCommit: payload.SourceCommit,
-		BuildTimeUTC: payload.BuildTimeUTC,
-		Artifacts:    artifacts,
-	}, nil
+	return http.DefaultClient
 }
 
 // CheckSupport verifies that self-update can run in the current environment.
@@ -167,10 +198,22 @@ func Apply(ctx context.Context, opts ApplyOptions) error {
 	if err := validateInstallEntries(opts.Entries); err != nil {
 		return errors.New("invalid install entries: " + err.Error())
 	}
+	if len(opts.PublicKeys) > 0 {
+		if err := VerifyManifest(opts.Manifest, opts.PublicKeys); err != nil {
+			return fmt.Errorf("verify update: %w", err)
+		}
+	}
 
 	artifact, err := selectArtifact(opts.Manifest, opts.ArtifactName)
 	if err != nil {
 		return errors.New("select artifact: " + err.Error())
+	}
+	if artifact.SHA256 == "" && (opts.RequireChecksum || len(opts.PublicKeys) > 0) {
+		return fmt.Errorf("verify update: %w", ErrChecksumMissing)
+	}
+	maxBytes := opts.MaxDownloadBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxDownloadBytes
 	}
 
 	archiveURL, err := resolveArtifactURL(strings.TrimRight(opts.BaseURL, "/"), artifact.URL)
@@ -186,8 +229,16 @@ func Apply(ctx context.Context, opts ApplyOptions) error {
 
 	archivePath := filepath.Join(tmpDir, "artifact.tar.gz")
 	notifyProgress(opts.OnProgress, StepDownloading)
-	if err := downloadFile(ctx, archiveURL, archivePath); err != nil {
+	digest, err := downloadFile(ctx, httpClient(opts.HTTPClient), archiveURL, archivePath, maxBytes)
+	if err != nil {
+		if errors.Is(err, ErrTooLarge) {
+			return fmt.Errorf("download update: %w", err)
+		}
 		return errors.New("download update: " + err.Error())
+	}
+	// Nothing is extracted before the checksum matches.
+	if artifact.SHA256 != "" && !checksumMatches(digest, artifact.SHA256) {
+		return fmt.Errorf("verify update: %w", ErrChecksumMismatch)
 	}
 
 	extractDir := filepath.Join(tmpDir, "extract")
@@ -373,30 +424,45 @@ func safeJoin(root, value string) (string, error) {
 	return target, nil
 }
 
-// downloadFile performs an HTTP GET for url and writes the response body to dest.
-// The request honours ctx for cancellation. An error is returned for any non-200 status.
-func downloadFile(ctx context.Context, url, dest string) error {
+// downloadFile performs an HTTP GET for url and writes at most maxBytes of
+// the response body to dest, returning the SHA-256 digest of what was
+// written. The request honours ctx for cancellation. An error is returned for
+// any non-200 status and ErrTooLarge for a body over maxBytes.
+func downloadFile(ctx context.Context, client *http.Client, url, dest string, maxBytes int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return errors.New("unexpected HTTP status: " + strconv.Itoa(resp.StatusCode))
+		return nil, errors.New("unexpected HTTP status: " + strconv.Itoa(resp.StatusCode))
+	}
+	if resp.ContentLength > maxBytes {
+		return nil, ErrTooLarge
 	}
 
 	out, err := os.Create(dest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+	hash := sha256.New()
+	n, err := io.Copy(io.MultiWriter(out, hash), io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if n > maxBytes {
+		return nil, ErrTooLarge
+	}
+	if err := out.Close(); err != nil {
+		return nil, err
+	}
+	return hash.Sum(nil), nil
 }
 
 // extractTarGz decompresses and extracts the gzip-compressed tar archive at archivePath
